@@ -1,252 +1,210 @@
-from collections import deque
-from collections import Counter
-import math
+from collections import Counter, defaultdict
 
-class SimpleBarcodeTracker:
-    
-    def __init__(self, history_size=7, min_stability=0.6, spatial_threshold=150, 
-                 position_span_threshold=150, position_stability_penalty=0.7, cooldown_frames=3):
-        # history_size: сколько последних кадров помним для каждой ячейки
-        # min_stability: минимальная доля появлений ячейки в истории, чтобы считать её реальной
-        # spatial_threshold: максимальное расстояние между центрами штрихкодов (пиксели), чтобы считать их одной ячейкой
-        # position_span_threshold: максимальный размах центров ячейки (пиксели) без штрафа
-        # position_stability_penalty: коэффициент штрафа за превышение размаха (0.7 = штраф 30%)
-        # cooldown_frames: сколько кадров нельзя переключаться после смены
-        self.history_size = history_size
-        self.min_stability = min_stability
-        self.spatial_threshold = spatial_threshold
-        self.position_span_threshold = position_span_threshold
-        self.position_stability_penalty = position_stability_penalty
-        self.cooldown_frames = cooldown_frames
-        
-        # track_history[текст] = очередь из 0 (не было) и 1 (было)
-        self.track_history = {}
-        # position_history[текст] = очередь из центров ячейки или None
-        self.position_history = {}
-        
-        self.current_anchor = None
-        self.current_anchor_center = None
-        self.switch_cooldown = 0  # сколько кадров нельзя переключаться после смены
-        self.switch_log = []
-    
-    def _calculate_center(self, bbox):
-        # bbox = [x1, y1, x2, y2]
-        # центр прямоугольника = среднее арифметическое противоположных углов
-        x1, y1, x2, y2 = bbox
-        return ((x1 + x2) / 2, (y1 + y2) / 2)
-    
-    def _distance_between_centers(self, center1, center2):
-        # евклидово расстояние между двумя точками
-        return math.sqrt((center1[0] - center2[0]) ** 2 + (center1[1] - center2[1]) ** 2)
-    
-    def _group_by_spatial_proximity(self, ocr_detections):
-        # вход: список штрихкодов от OCR, у каждого есть text, confidence, bbox
-        # выход: список физических ячеек (объединённые близкие штрихкоды)
-        
-        if not ocr_detections:
-            return []
-        
-        # добавляем каждому штрихкоду его центр для удобства
-        for det in ocr_detections:
-            det["center"] = self._calculate_center(det["bbox"])
-        
-        used = [False] * len(ocr_detections)
-        groups = []
-        
-        for i, det in enumerate(ocr_detections):
-            if used[i]:
+import numpy as np
+from norfair import Detection as NorfairDetection
+from norfair import Tracker as NorfairTracker
+
+
+def _calculate_center(bbox):
+    x1, y1, x2, y2 = bbox
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+
+def _distance(c1, c2):
+    dx = c1[0] - c2[0]
+    dy = c1[1] - c2[1]
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _group_within_pool(ocr_detections, spatial_threshold):
+    # Сырые рамки OCR в одну зону на кадре: одна точка на зону для Norfair.
+    if not ocr_detections:
+        return []
+
+    for det in ocr_detections:
+        det["center"] = _calculate_center(det["bbox"])
+
+    used = [False] * len(ocr_detections)
+    groups = []
+
+    for i, det in enumerate(ocr_detections):
+        if used[i]:
+            continue
+
+        group_detections = [det]
+        used[i] = True
+        group_center = det["center"]
+
+        for j, other in enumerate(ocr_detections):
+            if used[j]:
                 continue
-            
-            # начинаем новую группу с текущего штрихкода
-            group_detections = [det]
-            used[i] = True
-            group_center = det["center"]
-            
-            # ищем все штрихкоды, которые находятся рядом с центром группы
-            for j, other in enumerate(ocr_detections):
-                if used[j]:
-                    continue
-                
-                dist = self._distance_between_centers(group_center, other["center"])
-                if dist < self.spatial_threshold:
-                    group_detections.append(other)
-                    used[j] = True
-                    # после добавления пересчитываем центр группы как среднее арифметическое всех центров
-                    all_centers = [d["center"] for d in group_detections]
-                    group_center = (
-                        sum(c[0] for c in all_centers) / len(all_centers),
-                        sum(c[1] for c in all_centers) / len(all_centers)
-                    )
-            
-            # определяем текст группы: самый частый среди всех штрихкодов группы
-            texts = [d["text"] for d in group_detections]
-            most_common_text = Counter(texts).most_common(1)[0][0]
-            # уверенность группы: максимальная среди всех (берём лучший OCR)
-            max_confidence = max(d["confidence"] for d in group_detections)
-            
-            groups.append({
+
+            if _distance(group_center, other["center"]) < spatial_threshold:
+                group_detections.append(other)
+                used[j] = True
+                all_centers = [d["center"] for d in group_detections]
+                group_center = (
+                    sum(c[0] for c in all_centers) / len(all_centers),
+                    sum(c[1] for c in all_centers) / len(all_centers),
+                )
+
+        texts = [d["text"] for d in group_detections]
+        most_common_text = Counter(texts).most_common(1)[0][0]
+        max_confidence = max(d["confidence"] for d in group_detections)
+
+        groups.append(
+            {
                 "text": most_common_text,
                 "confidence": max_confidence,
                 "center": group_center,
-                "raw_detections": group_detections
-            })
-        
-        return groups
-    
-    def _update_history(self, cells):
-        # cells: список ячеек, обнаруженных в текущем кадре
-        # обновляем историю: для каждой ячейки добавляем 1 (была) или 0 (не была)
-        
-        current_texts = {cell["text"] for cell in cells}
-        
-        # ячейки, которые видны сейчас: добавляем 1 и центр
-        for cell in cells:
-            text = cell["text"]
-            if text not in self.track_history:
-                self.track_history[text] = deque(maxlen=self.history_size)
-                self.position_history[text] = deque(maxlen=self.history_size)
-            
-            self.track_history[text].append(1)
-            self.position_history[text].append(cell["center"])
-        
-        # ячейки, которые были в истории, но не видны сейчас: добавляем 0 и None
-        for text in list(self.track_history.keys()):
-            if text not in current_texts:
-                self.track_history[text].append(0)
-                self.position_history[text].append(None)
-    
-    def _calculate_stability(self, text):
-        # стабильность = доля кадров, где ячейка появлялась, за последние history_size кадров
-        # также штрафуем, если центры ячейки сильно прыгают между кадрами
-        
-        if text not in self.track_history:
-            return 0.0
-        
-        history = list(self.track_history[text])
-        if len(history) == 0:
-            return 0.0
-        
-        appearances = sum(history)
-        stability = appearances / len(history)
-        
-        # проверка стабильности позиции: если размах центров больше порога, применяем штраф
-        positions = list(self.position_history[text])
-        valid_positions = [p for p in positions if p is not None]
-        if len(valid_positions) >= 3:
-            # вычисляем размах координат (максимум - минимум) по X и Y
-            x_coords = [p[0] for p in valid_positions]
-            y_coords = [p[1] for p in valid_positions]
-            x_span = max(x_coords) - min(x_coords)
-            y_span = max(y_coords) - min(y_coords)
-            # берём худший (максимальный) размах
-            position_span = max(x_span, y_span)
-            
-            if position_span > self.position_span_threshold:
-                # снижаем стабильность на коэффициент (например 0.7 = штраф 30%)
-                stability = stability * self.position_stability_penalty
-        
-        return stability
-    
+                "raw_detections": group_detections,
+            }
+        )
+
+    return groups
+
+
+def group_detections_by_spatial_proximity(ocr_detections, spatial_threshold, partition_by_text=False):
+    if not ocr_detections:
+        return []
+    if not partition_by_text:
+        return _group_within_pool(ocr_detections, spatial_threshold)
+
+    buckets = defaultdict(list)
+    for d in ocr_detections:
+        buckets[d["text"]].append(d)
+    out = []
+    for pool in buckets.values():
+        out.extend(_group_within_pool(pool, spatial_threshold))
+    return out
+
+
+def _matched_this_frame(obj):
+    return obj.last_detection is not None and obj.last_detection.age == obj.age
+
+
+def _majority_text_for_object(obj):
+    texts = []
+    for d in obj.past_detections:
+        if d.data is not None and isinstance(d.data, dict):
+            t = d.data.get("text")
+            if t is not None:
+                texts.append(t)
+    ld = obj.last_detection
+    if ld is not None and ld.data is not None and isinstance(ld.data, dict):
+        t = ld.data.get("text")
+        if t is not None:
+            texts.append(t)
+    if not texts:
+        return None
+    return Counter(texts).most_common(1)[0][0]
+
+
+def _estimate_center_tuple(obj):
+    est = obj.estimate
+    if est is None or len(est) == 0:
+        return None
+    return (float(est[0, 0]), float(est[0, 1]))
+
+
+class BarcodeTracker:
+    def __init__(
+        self,
+        history_size=7,
+        spatial_threshold=150,
+        association_gate=None,
+        max_missed_frames=5,
+        partition_by_text=False,
+        norfair_initialization_delay=None,
+    ):
+        self.history_size = history_size
+        self.spatial_threshold = spatial_threshold
+        self.association_gate = association_gate if association_gate is not None else spatial_threshold * 1.2
+        self.max_missed_frames = max_missed_frames
+        self.partition_by_text = partition_by_text
+        nid = norfair_initialization_delay
+        self._norfair_init_delay = 0 if nid is None else nid
+
+        hc = max(4, max_missed_frames + 2)
+        init_d = max(0, min(hc - 1, self._norfair_init_delay))
+        self._norfair = NorfairTracker(
+            distance_function="euclidean",
+            distance_threshold=self.association_gate,
+            hit_counter_max=hc,
+            initialization_delay=init_d,
+            past_detections_length=max(1, history_size),
+        )
+
     def update(self, ocr_detections):
-        # ВХОД: список словарей от OCR
-        # каждый словарь содержит:
-        #   "text": строка с адресом (например "A12")
-        #   "confidence": число от 0 до 1, насколько OCR уверен
-        #   "bbox": список [x1, y1, x2, y2] координаты прямоугольника
-        
-        # шаг 1: группируем близкие штрихкоды в физические ячейки
-        input_cells = self._group_by_spatial_proximity(ocr_detections)
-        
-        # шаг 2: обновляем историю для каждой ячейки
-        self._update_history(input_cells)
-        
-        # шаг 3: уменьшаем счётчик переключения (если активен)
-        if self.switch_cooldown > 0:
-            self.switch_cooldown -= 1
-        
-        # шаг 4: вычисляем стабильность для каждой видимой ячейки
-        candidates = []
-        for cell in input_cells:
-            text = cell["text"]
-            stability = self._calculate_stability(text)
-            candidates.append({
-                "text": text,
-                "stability": stability,
-                "center": cell["center"],
-                "confidence": cell["confidence"]
-            })
-        
-        # шаг 5: если нет кандидатов, возвращаем предыдущий якорь
-        if not candidates:
-            return {
-                "anchor": self.current_anchor,
-                "anchor_center": self.current_anchor_center,
-                "confidence": 0.0,
-                "just_switched": False,
-                "all_visible_cells": []
-            }
-        
-        # шаг 6: выбираем ячейку с максимальной стабильностью
-        best_candidate = max(candidates, key=lambda x: x["stability"])
-        
-        # если даже лучшая ячейка недостаточно стабильна, не меняем якорь
-        if best_candidate["stability"] < self.min_stability:
-            return {
-                "anchor": self.current_anchor,
-                "anchor_center": self.current_anchor_center,
-                "confidence": best_candidate["stability"],
-                "just_switched": False,
-                "all_visible_cells": [(c["text"], c["stability"]) for c in candidates]
-            }
-        
-        # шаг 7: проверяем, нужно ли переключить якорь
-        if self.switch_cooldown == 0 and self.current_anchor != best_candidate["text"]:
-            # переключение!
-            self.switch_log.append({
-                "from": self.current_anchor,
-                "to": best_candidate["text"],
-                "frame": None  # можно установить номер кадра извне
-            })
-            self.current_anchor = best_candidate["text"]
-            self.current_anchor_center = best_candidate["center"]
-            self.switch_cooldown = self.cooldown_frames  # cooldown на указанное количество кадров
-            just_switched = True
+        cells = group_detections_by_spatial_proximity(
+            ocr_detections,
+            self.spatial_threshold,
+            partition_by_text=self.partition_by_text,
+        )
+        if cells:
+            norfair_dets = []
+            for cell in cells:
+                cx, cy = cell["center"]
+                norfair_dets.append(
+                    NorfairDetection(
+                        points=np.array([[float(cx), float(cy)]], dtype=np.float64),
+                        scores=None,
+                        data={
+                            "text": cell["text"],
+                            "confidence": cell["confidence"],
+                            "center": cell["center"],
+                        },
+                    )
+                )
+            active_objects = self._norfair.update(norfair_dets)
         else:
-            just_switched = False
-            # если якоря ещё не было, устанавливаем
-            if self.current_anchor is None:
-                self.current_anchor = best_candidate["text"]
-                self.current_anchor_center = best_candidate["center"]
-        
-        # ВЫХОД: словарь с полями
-        #   "anchor": текущий адрес дрона (строка или None)
-        #   "anchor_center": координаты центра якоря ((x, y) или None)
-        #   "confidence": уверенность в текущем якоре (число 0..1)
-        #   "just_switched": True если только что произошло переключение
-        #   "all_visible_cells": список всех видимых ячеек с их стабильностью
-        return {
-            "anchor": self.current_anchor,
-            "anchor_center": self.current_anchor_center,
-            "confidence": best_candidate["stability"],
-            "just_switched": just_switched,
-            "all_visible_cells": [(c["text"], c["stability"]) for c in candidates]
-        }
-        
-# Пример использования
-tracker = SimpleBarcodeTracker(
-    history_size=7,
-    min_stability=0.6,
-    spatial_threshold=150,
-    position_span_threshold=150,
-    position_stability_penalty=0.7,
-    cooldown_frames=3
-)
+            active_objects = self._norfair.update(None)
 
-ocr_results = [
-    {"text": "A12", "confidence": 0.92, "bbox": [100, 200, 120, 220]},
-    {"text": "A12", "confidence": 0.87, "bbox": [105, 195, 125, 215]},
-    {"text": "B34", "confidence": 0.45, "bbox": [300, 200, 320, 220]}
-]
+        instances = []
+        for obj in active_objects:
+            if obj.id is None or not _matched_this_frame(obj):
+                continue
+            data = obj.last_detection.data
+            if not isinstance(data, dict):
+                continue
+            center = data.get("center")
+            if center is None:
+                center = _estimate_center_tuple(obj)
+            instances.append(
+                {
+                    "track_id": obj.id,
+                    "text": _majority_text_for_object(obj),
+                    "text_frame": data.get("text"),
+                    "center": center,
+                    "confidence": data.get("confidence", 0.0),
+                }
+            )
 
-result = tracker.update(ocr_results)
-print(result["anchor"])
+        return {"instances": instances}
+
+
+if __name__ == "__main__":
+    tracker = BarcodeTracker(
+        spatial_threshold=80,
+        association_gate=120,
+        max_missed_frames=4,
+    )
+
+    frames = [
+        [
+            {"text": "A12", "confidence": 0.9, "bbox": [10, 10, 30, 30]},
+            {"text": "A12", "confidence": 0.85, "bbox": [200, 200, 222, 222]},
+        ],
+        [
+            {"text": "A12", "confidence": 0.88, "bbox": [12, 11, 32, 31]},
+            {"text": "A1Z", "confidence": 0.55, "bbox": [202, 198, 224, 220]},
+        ],
+        [
+            {"text": "A12", "confidence": 0.91, "bbox": [13, 12, 33, 32]},
+            {"text": "A12", "confidence": 0.72, "bbox": [204, 200, 226, 222]},
+        ],
+    ]
+
+    for i, det in enumerate(frames):
+        r = tracker.update(det)
+        print(f"кадр {i}: всего экземпляров {len(r['instances'])}", r["instances"])
